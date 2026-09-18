@@ -11,76 +11,87 @@ ETHUSDT
 
 Architecture:
     Historical OHLCV
-        ?
+        ↓
     Technical Features
-        ?
+        ↓
     Sequence
-        ?
+        ↓
     GRU
-        ?
+        ↓
     GRU
-        ?
+        ↓
     Multi-Head Attention
-        ?
+        ↓
     Dense
-        ?
+        ↓
     Future Log Return
 
 IMPORTANT:
     Prediction != Signal != Position
 
-??? ???? ??? ????? research / training / backtesting ??? ???.
-???? Signal Engine ? Position Management ????? ?? crypto-signal-api
-?????????? ??????.
+این فایل فقط مسئول research / training / backtesting مدل است.
+منطق Signal Engine و Position Management بعداً در crypto-signal-api
+پیاده‌سازی می‌شود.
 
 Target:
     future_log_return = log(close[t+horizon] / close[t])
 
-?????:
+مثلاً:
     timeframe = 5m
     horizon = 15m
     horizon_steps = 3
 
-???? ??? ?? sequence ?????? ????? ???? ?????? 15 ????? ????? ??
-???????? ??????.
+یعنی مدل با sequence گذشته، بازده مورد انتظار 15 دقیقه آینده را
+پیش‌بینی می‌کند.
+
+چرا log-return به‌جای قیمت خام:
+    1) جمع‌پذیری زمانی: log(P2/P1) + log(P3/P2) = log(P3/P1)
+    2) تقارن: +x% و -x% به قیمت اولیه برمی‌گردونه (با درصد ساده اینطور نیست)
+    3) توزیع نزدیک‌تر به نرمال - برای loss function و scaler مناسب‌تره
 
 Sequence:
     sequence_length = 96
 
-???? ???? ?? prediction ??? 96 ???? 5 ???????? ?? ???????:
-    96 � 5m = 8 hours
+یعنی برای هر prediction مدل 96 کندل 5 دقیقه‌ای را می‌بیند:
+    96 × 5m = 8 hours
 
 Attention:
-    Attention ??? Sequence ?? ????????.
-    GRU ??? sequence ???? ?????? ? hidden state ????? ??????.
-    Attention ??? ??????? ???? timestep??? sequence ???? prediction
-    ???? ?????? ?????.
+    Attention جای Sequence را نمی‌گیرد.
+    GRU روی sequence حرکت می‌کند و hidden state تولید می‌کند.
+    Attention یاد می‌گیرد کدام timestepهای sequence برای prediction
+    فعلی مهم‌تر هستند.
 
 Validation:
     Walk-forward validation
 
 Scaling:
-    Scaler ??? ??? train ?? fold fit ??????.
-    Validation ? Test ??? transform ???????.
+    Scaler فقط روی train هر fold fit می‌شود.
+    Validation و Test فقط transform می‌شوند.
 
-Backtest:
-    - LONG
-    - SHORT
-    - NO TRADE
-    - fee
-    - slippage
-    - threshold
+Risk Management در Backtest (اصلاح‌شده نسبت به نسخه‌ی قبلی این فایل):
+    نسخه‌ی قبلی از STOP_LOSS_PCT / TAKE_PROFIT_PCT به‌صورت درصد *ثابت*
+    استفاده می‌کرد - یعنی در بازار پرنوسان حد ضرر خیلی زود فعال می‌شد و
+    در بازار کم‌نوسان خیلی گشاد بود. این نسخه SL/TP را بر پایه‌ی ATR
+    لحظه‌ای هر anchor محاسبه می‌کند (هماهنگ با منطق trade_decision.py
+    در crypto-signal-api) تا با نوسان واقعی بازار در هر لحظه سازگار باشد.
+
+Backtest شامل:
+    - LONG / SHORT / NO TRADE
+    - fee (round-trip)
+    - slippage (round-trip)
+    - threshold سیگنال
+    - ATR-based stop-loss / take-profit (نه درصد ثابت)
     - fixed-risk position sizing
-    - max position loss protection
     - equity curve
     - drawdown
-    - Sharpe ??????
+    - Sharpe تقریبی
     - profit factor
 """
 
 import os
 import json
 import random
+import gc
 from dataclasses import dataclass
 
 import joblib
@@ -136,7 +147,7 @@ assert HORIZON_MINUTES % TIMEFRAME_MINUTES == 0
 
 HORIZON_STEPS = HORIZON_MINUTES // TIMEFRAME_MINUTES
 
-# 96 � 5m = 8 hours of history
+# 96 × 5m = 8 hours of history
 SEQUENCE_LENGTH = 96
 
 N_FOLDS = 4
@@ -166,20 +177,38 @@ RISK_PER_TRADE = 0.01  # 1%
 # We keep this low for the MVP.
 MAX_LEVERAGE = 1.0
 
-# Stop distance used only by the MVP backtest.
-# Later this should be replaced by ATR / volatility / structure based risk.
-STOP_LOSS_PCT = 0.0030  # 0.30%
+# --- ATR-based risk management (جایگزین STOP_LOSS_PCT/TAKE_PROFIT_PCT ثابت) ---
+# فاصله‌ی حد ضرر = ATR_MULTIPLIER_SL × (ATR در لحظه‌ی anchor / anchor_price)
+# فاصله‌ی حد سود = ATR_MULTIPLIER_TP × همون نسبت
+# این باعث می‌شه SL/TP با نوسان واقعی بازار در هر لحظه (نه یک درصد ثابت
+# برای کل تاریخچه) سازگار باشه - دقیقاً همون منطقی که در trade_decision.py
+# برای معاملات دستی هم استفاده می‌کنیم، تا بک‌تست و اجرای واقعی هم‌خوان باشن.
+ATR_MULTIPLIER_SL = 1.5
+ATR_MULTIPLIER_TP = 2.25  # نسبت ریسک/ریوارد پیش‌فرض 1:1.5
 
-TAKE_PROFIT_PCT = 0.0045  # 0.45%
+# حداقل و حداکثر فاصله‌ی SL به‌عنوان درصد قیمت - محافظ در برابر ATR غیرعادی
+# (مثلاً داده‌ی خراب یا نوسان لحظه‌ای extreme)
+MIN_STOP_LOSS_PCT = 0.0015  # 0.15%
+MAX_STOP_LOSS_PCT = 0.0100  # 1.00%
 
 MAX_HOLDING_STEPS = HORIZON_STEPS
 
 EPOCHS = 100
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 
 PATIENCE = 10
 
 OUTPUT_DIR = "/content/drive/MyDrive/model_outputs_gru"
+
+# --- Quick Test (برای اجرای سریع/سنجش سلامت pipeline قبل از اجرای کامل) ---
+# وقتی True باشه: فقط آخرین QUICK_TEST_ROWS ردیف دیتا استفاده می‌شه و
+# epochs به QUICK_TEST_EPOCHS محدود می‌شه - برای این‌که ظرف چند دقیقه
+# مطمئن بشید کل pipeline (از load تا save) بدون خطا اجرا می‌شه، قبل از
+# اینکه با ۸ سال داده و epochs کامل (که ساعت‌ها طول می‌کشه) ریسک کنید.
+# بعد از موفقیت‌آمیز بودن این تست، حتماً QUICK_TEST = False کنید.
+QUICK_TEST = False
+QUICK_TEST_ROWS = 20_000
+QUICK_TEST_EPOCHS = 5
 
 # Set True only when you intentionally want tuner.
 USE_HYPERPARAMETER_SEARCH = False
@@ -194,7 +223,7 @@ HP_SEARCH_EPOCHS_PER_TRIAL = 30
 
 def set_seed(seed=SEED):
     """
-    ???? ???? reproducible ???? training.
+    تلاش برای reproducible کردن training.
     """
     os.environ["PYTHONHASHSEED"] = str(seed)
 
@@ -337,10 +366,10 @@ def load_and_preprocess_data(file_path):
 
 def check_candle_gaps(data, timeframe_minutes):
     """
-    ????? gap??? ?????.
+    بررسی gapهای زمانی.
 
-    Gap ??????? ?? ???? ???? ???? ???? ????.
-    ??? ????? ?????? ?? ?????? dataset ?? ???? ????.
+    Gap الزاماً به معنی خراب بودن داده نیست.
+    فقط گزارش می‌شود تا بدانیم dataset چه وضعی دارد.
     """
 
     expected_delta = pd.Timedelta(
@@ -389,9 +418,9 @@ def create_future_log_return_target(
 
         log(close[t+h] / close[t])
 
-    ????? ?? index ???? t ???? ????.
+    خروجی به index همان t تعلق دارد.
 
-    ????:
+    مثال:
 
         t = 12:00
         horizon = 3 candles
@@ -419,22 +448,34 @@ def create_sequences(
     seq_length,
 ):
     """
-    ???? sequence ???? supervised learning.
+    ساخت sequence برای supervised learning.
+
+    اصلاح مهم (رفع باگ alignment نسخه‌ی قبلی):
+    قبلاً sequence به‌صورت features[i-seq_length:i] بود (یعنی آخرین ردیف
+    دیده‌شده i-1 بود) در حالی که target و anchor به ردیف i تعلق داشتن.
+    این یعنی مدل دقیقاً همون کندلی که ازش anchor/target ساخته می‌شد رو
+    در ورودی نمی‌دید - یک off-by-one واقعی که هم یادگیری رو سخت‌تر از
+    حد لازم می‌کرد و هم با نحوه‌ی inference واقعی (که سکانس باید به
+    آخرین کندل بسته‌شده ختم بشه) ناهماهنگ بود.
+
+    حالا:
+        X[k] = features[i-seq_length+1 : i+1]   (شامل خود ردیف i، anchor)
+        y[k] = target[i]                         (log(close[i+h]/close[i]))
+
+    یعنی آخرین ردیف sequence دقیقاً همون کندلیه که target ازش محاسبه شده.
 
     X:
-        [i-seq_length : i]
-
-    ????? timestep ?? X ????? ?? ???? t ???.
+        [i-seq_length+1 : i+1]  (inclusive of anchor row i)
 
     y:
-        target[t]
+        target[t] که t = i (آخرین ردیف X)
 
-    ????????:
+    بنابراین:
 
-        X -> history ending at t
+        X -> history ending at t (شامل خود t)
         y -> future return from t to t+horizon
 
-    ????? ???? target ???? ??? ????.
+    اینجا دیگر target قیمت خام نیست.
     """
 
     X = []
@@ -446,14 +487,14 @@ def create_sequences(
             "must have the same length."
         )
 
-    for i in range(seq_length, len(features_array)):
+    for i in range(seq_length - 1, len(features_array)):
         target_value = target_array[i]
 
         if not np.isfinite(target_value):
             continue
 
         sequence = features_array[
-            i - seq_length:i
+            i - seq_length + 1: i + 1
         ]
 
         if not np.all(np.isfinite(sequence)):
@@ -491,9 +532,12 @@ def create_sequences_with_indices(
     seq_length,
 ):
     """
-    ???? create_sequences ??? timestamp ????? ?? anchor ?? ?? ???????????.
+    همان create_sequences ولی timestamp مربوط به anchor را هم برمی‌گرداند.
 
-    ??? ???? evaluation ? backtest ????? ??? ???.
+    همون اصلاح off-by-one که در create_sequences اعمال شد اینجا هم اعمال
+    شده: X شامل خود ردیف anchor (i) به‌عنوان آخرین timestep است.
+
+    این برای evaluation و backtest بسیار مهم است.
     """
 
     X = []
@@ -501,14 +545,14 @@ def create_sequences_with_indices(
     anchor_indices = []
     anchor_times = []
 
-    for i in range(seq_length, len(features_array)):
+    for i in range(seq_length - 1, len(features_array)):
         target_value = target_array[i]
 
         if not np.isfinite(target_value):
             continue
 
         sequence = features_array[
-            i - seq_length:i
+            i - seq_length + 1: i + 1
         ]
 
         if not np.all(np.isfinite(sequence)):
@@ -543,6 +587,133 @@ def create_sequences_with_indices(
         np.asarray(anchor_indices, dtype=np.int64),
         pd.DatetimeIndex(anchor_times),
     )
+
+
+# ============================================================
+# LAZY SEQUENCE DATASET (رفع OOM)
+# ============================================================
+#
+# مشکل نسخه‌ی eager (create_sequences/create_sequences_with_indices):
+# کل تانسور N × seq_length × n_features رو یکجا در RAM می‌سازه. با ۸ سال
+# داده‌ی ۵ دقیقه‌ای (~۸۴۰,۰۰۰ ردیف) و seq_length=96، این یعنی چیزی حدود
+# 840000 × 96 × 20 × 4 بایت ≈ 6.4 گیگابایت فقط برای X_train - که به‌راحتی
+# باعث OOM می‌شه، مخصوصاً روی Colab.
+#
+# راه‌حل: به‌جای ساختن این آرایه‌ی عظیم، دو مرحله انجام می‌دیم:
+#   ۱) یک اسکن سریع و کاملاً برداری (vectorized, بدون حلقه‌ی پایتونی روی
+#      هر پنجره) که فقط مشخص می‌کنه کدوم anchor ها معتبرن (target و کل
+#      پنجره‌ی ورودی‌شون finite هستن) - این فقط آرایه‌های O(N) می‌سازه،
+#      نه O(N × seq_length).
+#   ۲) یک tf.data.Dataset مبتنی بر generator که پنجره‌ها رو یکی‌یکی (یا
+#      batch به batch) در لحظه‌ی نیاز می‌سازه و بلافاصله بعد از استفاده
+#      آزادشون می‌کنه - هیچ‌وقت همه رو همزمان در حافظه نگه نمی‌داره.
+# ============================================================
+
+def compute_valid_anchor_mask(features_array, target_array, seq_length):
+    """
+    نسخه‌ی برداری (vectorized) از منطق اعتبارسنجی که در create_sequences
+    با حلقه‌ی پایتونی انجام می‌شد - همون نتیجه رو می‌ده ولی بدون ساختن
+    هیچ آرایه‌ی O(N × seq_length)ای.
+
+    خروجی: آرایه‌ی boolean به طول len(features_array)، که در ایندکس i
+    مقدار True یعنی: هم target[i] finite است، هم تمام seq_length ردیف
+    قبل از i (شامل خودش) finite هستن - یعنی می‌شه یک sequence معتبر با
+    anchor=i ساخت.
+    """
+    n = len(features_array)
+
+    row_finite = np.all(
+        np.isfinite(features_array), axis=1
+    )
+
+    # شمارش تجمعی ردیف‌های غیر-finite برای چک سریع "همه‌ی پنجره finite است؟"
+    invalid = (~row_finite).astype(np.int32)
+    cumsum = np.concatenate(([0], np.cumsum(invalid)))
+
+    valid_mask = np.zeros(n, dtype=bool)
+
+    if n >= seq_length:
+        idx = np.arange(seq_length - 1, n)
+        window_start = idx - seq_length + 1
+        # تعداد ردیف‌های نامعتبر در پنجره‌ی [window_start, idx] (inclusive)
+        window_invalid_count = (
+            cumsum[idx + 1] - cumsum[window_start]
+        )
+        window_all_finite = window_invalid_count == 0
+
+        target_finite = np.isfinite(
+            target_array[idx]
+        )
+
+        valid_mask[idx] = window_all_finite & target_finite
+
+    return valid_mask
+
+
+def build_lazy_sequence_dataset(
+    features_array,
+    target_array,
+    seq_length,
+    batch_size,
+    shuffle_buffer=None,
+):
+    """
+    ساخت یک tf.data.Dataset که sequenceها رو lazy (به‌ازای هر batch، نه
+    یکجا برای کل دیتاست) تولید می‌کنه.
+
+    برمی‌گردونه:
+        dataset:      tf.data.Dataset از (X_batch, y_batch)
+        valid_anchors: آرایه‌ی ایندکس anchor های معتبر (به همون ترتیبی که
+                       generator تولیدشون می‌کنه) - برای بازسازی anchor
+                       price/ATR/timestamp در evaluation/backtest لازمه.
+
+    نکته: shuffle_buffer فقط باید برای train استفاده بشه؛ برای val/test
+    باید None بمونه چون ترتیب زمانی برای ساخت anchor/backtest لازمه.
+    """
+
+    valid_mask = compute_valid_anchor_mask(
+        features_array, target_array, seq_length
+    )
+    valid_anchors = np.nonzero(valid_mask)[0].astype(np.int64)
+
+    n_features = features_array.shape[1]
+
+    def gen():
+        for i in valid_anchors:
+            window = features_array[
+                i - seq_length + 1: i + 1
+            ]
+            yield window, target_array[i]
+
+    output_signature = (
+        tf.TensorSpec(
+            shape=(seq_length, n_features),
+            dtype=tf.float32,
+        ),
+        tf.TensorSpec(
+            shape=(),
+            dtype=tf.float32,
+        ),
+    )
+
+    dataset = tf.data.Dataset.from_generator(
+        gen,
+        output_signature=output_signature,
+    )
+
+    if shuffle_buffer:
+        dataset = dataset.shuffle(
+            shuffle_buffer,
+            reshuffle_each_iteration=True,
+        )
+
+    dataset = dataset.batch(
+        batch_size
+    ).prefetch(
+        tf.data.AUTOTUNE
+    )
+
+    return dataset, valid_anchors
 
 
 # ============================================================
@@ -756,6 +927,16 @@ def train_model(
 ):
     """
     Train with validation and early stopping.
+
+    این تابع دو حالت ورودی رو پشتیبانی می‌کنه (برای حفظ سازگاری با
+    فراخوانی‌های قدیمی/eager، طبق اصل «کد اصلی حذف نمی‌شود»):
+
+    ۱) حالت جدید (lazy، برای اجرای اصلی با دیتای بزرگ): X_train و X_val
+       یک tf.data.Dataset هستن که هرکدوم از قبل (X, y) رو batch شده
+       برمی‌گردونن - در این حالت y_train/y_val باید None باشن.
+
+    ۲) حالت قدیمی (eager، برای دیتای کوچیک/تست دستی): X_train/y_train و
+       X_val/y_val آرایه‌ی numpy هستن - رفتار دقیقاً مثل قبل.
     """
 
     os.makedirs(
@@ -788,23 +969,44 @@ def train_model(
         verbose=1 if verbose else 0,
     )
 
-    history = model.fit(
-        X_train,
-        y_train,
-        validation_data=(
-            X_val,
-            y_val,
-        ),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[
-            early_stopping,
-            lr_schedule,
-            checkpoint,
-        ],
-        verbose=verbose,
-        shuffle=False,
+    is_dataset = isinstance(
+        X_train, tf.data.Dataset
     )
+
+    if is_dataset:
+        # حالت lazy: دیتاست از قبل batch شده، دیگه نه y جدا لازمه نه
+        # batch_size/shuffle (چون خودش batching رو مدیریت می‌کنه و برای
+        # سری زمانی شافل نمی‌شه)
+        history = model.fit(
+            X_train,
+            validation_data=X_val,
+            epochs=epochs,
+            callbacks=[
+                early_stopping,
+                lr_schedule,
+                checkpoint,
+            ],
+            verbose=verbose,
+        )
+    else:
+        # حالت قدیمی eager - دقیقاً همون رفتار قبلی
+        history = model.fit(
+            X_train,
+            y_train,
+            validation_data=(
+                X_val,
+                y_val,
+            ),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[
+                early_stopping,
+                lr_schedule,
+                checkpoint,
+            ],
+            verbose=verbose,
+            shuffle=False,
+        )
 
     return model, history
 
@@ -818,7 +1020,7 @@ def directional_accuracy(
     y_pred,
 ):
     """
-    ???? ?????? ?? ??? ??? ???? ?? ???? ????? ????.
+    درصد مواردی که مدل جهت حرکت را درست تشخیص داده.
     """
 
     y_true = np.asarray(y_true)
@@ -868,7 +1070,7 @@ def evaluate_return_predictions(
     y_pred,
 ):
     """
-    Evaluation ????? future return.
+    Evaluation مخصوص future return.
     """
 
     y_true = np.asarray(y_true).reshape(-1)
@@ -928,7 +1130,7 @@ def naive_zero_return_metrics(
 
         future return = 0
 
-    ????:
+    یعنی:
 
         future price = current price
     """
@@ -950,7 +1152,7 @@ def naive_zero_return_metrics(
 
 
 # ============================================================
-# PREDICTION ? PRICE
+# PREDICTION → PRICE
 # ============================================================
 
 def log_return_to_future_price(
@@ -962,6 +1164,10 @@ def log_return_to_future_price(
 
         future_price =
             anchor_price * exp(predicted_log_return)
+
+    این تابع دقیقاً همونیه که crypto-signal-api باید موقع inference صدا
+    بزنه تا خروجی مدل (بازده‌ی لگاریتمی) رو به یک قیمت واقعی قابل‌نمایش
+    تبدیل کنه - وگرنه API عددی مثل 0.0032 رو به‌جای قیمت برمی‌گردونه.
     """
 
     return (
@@ -1046,8 +1252,8 @@ def calculate_sharpe(
     """
     Sharpe approximation based on trade returns.
 
-    ??? Sharpe ????? production ????.
-    ??? ???? ???????? ??????? ?????? ??????? ??????.
+    این Sharpe نهایی production نیست.
+    فقط برای مقایسه‌ی اولیه‌ی مدل‌ها استفاده می‌شود.
     """
 
     returns = np.asarray(
@@ -1073,6 +1279,55 @@ def calculate_sharpe(
 
 
 # ============================================================
+# ATR-BASED STOP-LOSS / TAKE-PROFIT
+# ============================================================
+
+def compute_atr_based_risk_distances(
+    atr_values,
+    anchor_prices,
+    atr_multiplier_sl=ATR_MULTIPLIER_SL,
+    atr_multiplier_tp=ATR_MULTIPLIER_TP,
+    min_stop_loss_pct=MIN_STOP_LOSS_PCT,
+    max_stop_loss_pct=MAX_STOP_LOSS_PCT,
+):
+    """
+    اصلاح اصلی این نسخه نسبت به قبلی: به‌جای STOP_LOSS_PCT/TAKE_PROFIT_PCT
+    ثابت برای کل بک‌تست، فاصله‌ی SL/TP هر معامله را از ATR همان لحظه
+    (anchor) محاسبه می‌کند - یعنی در کندل‌های پرنوسان حد ضرر گشادتر و در
+    کندل‌های کم‌نوسان تنگ‌تر می‌شود؛ دقیقاً منطقی که یک تریدر واقعی هم
+    برای مدیریت ریسک استفاده می‌کند.
+
+    خروجی: دو آرایه (stop_loss_pct_array, take_profit_pct_array) هم‌طول
+    با anchor_prices - هرکدام به‌صورت کسر مثبت (مثلاً 0.003 = 0.3%).
+
+    clip بین min/max_stop_loss_pct به‌عنوان محافظ در برابر مقادیر ATR
+    غیرعادی (مثلاً به‌خاطر gap قیمتی یا داده‌ی خراب) اعمال می‌شود.
+    """
+
+    atr_values = np.asarray(atr_values, dtype=float)
+    anchor_prices = np.asarray(anchor_prices, dtype=float)
+
+    # نسبت ATR به قیمت - این عدد "نوسان نسبی لحظه‌ای" است
+    atr_pct = np.where(
+        anchor_prices > 0,
+        atr_values / anchor_prices,
+        np.nan,
+    )
+
+    stop_loss_pct = atr_multiplier_sl * atr_pct
+    take_profit_pct = atr_multiplier_tp * atr_pct
+
+    stop_loss_pct = np.clip(
+        stop_loss_pct, min_stop_loss_pct, max_stop_loss_pct
+    )
+    # TP را با همون نسبت نسبت به SL کلیپ‌شده تنظیم می‌کنیم تا risk/reward حفظ بشه
+    risk_reward_ratio = atr_multiplier_tp / atr_multiplier_sl
+    take_profit_pct = stop_loss_pct * risk_reward_ratio
+
+    return stop_loss_pct, take_profit_pct
+
+
+# ============================================================
 # REALISTIC MVP BACKTEST
 # ============================================================
 
@@ -1080,44 +1335,66 @@ def backtest_strategy(
     anchor_prices,
     actual_future_returns,
     predicted_returns,
+    atr_values,
+    future_highs=None,
+    future_lows=None,
     timestamps=None,
     initial_capital=INITIAL_CAPITAL,
     fee_rate=FEE_RATE,
     slippage_rate=SLIPPAGE_RATE,
     signal_threshold=SIGNAL_THRESHOLD,
     risk_per_trade=RISK_PER_TRADE,
-    stop_loss_pct=STOP_LOSS_PCT,
-    take_profit_pct=TAKE_PROFIT_PCT,
+    atr_multiplier_sl=ATR_MULTIPLIER_SL,
+    atr_multiplier_tp=ATR_MULTIPLIER_TP,
     max_leverage=MAX_LEVERAGE,
 ):
     """
     MVP trading simulation.
 
     Important:
-        ??? backtest ???? execution engine ????? ????.
+        این backtest هنوز execution engine واقعی نیست.
 
-    ???? ?? prediction:
+    برای هر prediction:
 
         predicted_return > threshold
-            ? LONG
+            → LONG
 
         predicted_return < -threshold
-            ? SHORT
+            → SHORT
 
         otherwise
-            ? NO TRADE
+            → NO TRADE
 
-    ??? actual future return ???? horizon ?? ???? ???? ????? ??????? ???????.
+    سپس actual future return همان horizon را برای سنجش نتیجه استفاده می‌کنیم.
 
-    Stop/TP:
-        ?? ??? ???? ??? ?? future horizon return ???????? ???????.
-        ???? backtest tick-level ?????? ????? ???? ?? high/low ????????
-        ??? entry ? exit ??????? ????.
+    Stop/TP (اصلاح‌شده - نسخه‌ی مسیر-محور/path-dependent):
+        دیگر درصد ثابت نیستند - از compute_atr_based_risk_distances با
+        ATR واقعی هر anchor محاسبه می‌شوند.
+
+        اصلاح مهم نسبت به نسخه‌ی قبلی: قبلاً SL/TP فقط با مقایسه‌ی بازده‌ی
+        نهایی کل افق (close-to-close بعد از horizon_steps کندل) تشخیص داده
+        می‌شد - یعنی اگه قیمت وسط راه به SL می‌خورد ولی در پایان افق به
+        محدوده‌ی سود برمی‌گشت، backtest اشتباهاً اون رو TAKE_PROFIT/TIME_EXIT
+        حساب می‌کرد، در حالی که در واقعیت معامله خیلی زودتر با ضرر بسته
+        می‌شد.
+
+        حالا اگه future_highs/future_lows داده بشه (آرایه‌ی shape
+        (n_samples, horizon_steps) از high/low هر کندل بین anchor تا پایان
+        افق)، این تابع کندل‌به‌کندل جلو می‌ره و اولین لحظه‌ای که SL یا TP
+        واقعاً لمس شده رو پیدا می‌کنه - دقیقاً مثل یک معامله‌ی واقعی.
+        اگه در یک کندل *هم* SL *هم* TP لمس بشن (چون فقط high/low داریم، نه
+        ترتیب دقیق تیک‌به‌تیک)، قانون محافظه‌کارانه‌ی ثابت اعمال می‌شه:
+        فرض می‌کنیم SL زودتر خورده (بدبینانه، برای جلوگیری از خوش‌بینی
+        کاذب در نتایج بک‌تست).
+
+        اگه future_highs/future_lows داده نشه (None)، رفتار قبلی (فقط
+        بر پایه‌ی بازده‌ی نهایی افق) به‌عنوان fallback حفظ می‌شه - برای
+        سازگاری با فراخوانی‌های قدیمی.
 
     Position sizing:
-        risk_per_trade / stop_loss_pct
+        risk_per_trade / stop_loss_pct  (حالا per-trade، نه ثابت)
 
-    ??? leverage ????? ??????.
+    اما leverage محدود می‌شود.
     """
 
     anchor_prices = np.asarray(
@@ -1135,14 +1412,28 @@ def backtest_strategy(
         dtype=float,
     )
 
+    atr_values = np.asarray(
+        atr_values,
+        dtype=float,
+    )
+
     if not (
         len(anchor_prices)
         == len(actual_future_returns)
         == len(predicted_returns)
+        == len(atr_values)
     ):
         raise ValueError(
             "Backtest input arrays must have equal length."
         )
+
+    # --- محاسبه‌ی SL/TP اختصاصی هر anchor بر پایه‌ی ATR ---
+    stop_loss_pct_arr, take_profit_pct_arr = compute_atr_based_risk_distances(
+        atr_values,
+        anchor_prices,
+        atr_multiplier_sl=atr_multiplier_sl,
+        atr_multiplier_tp=atr_multiplier_tp,
+    )
 
     capital = float(
         initial_capital
@@ -1168,10 +1459,15 @@ def backtest_strategy(
 
         anchor = anchor_prices[i]
 
+        stop_loss_pct = stop_loss_pct_arr[i]
+        take_profit_pct = take_profit_pct_arr[i]
+
         if not (
             np.isfinite(prediction)
             and np.isfinite(actual_return)
             and np.isfinite(anchor)
+            and np.isfinite(stop_loss_pct)
+            and np.isfinite(take_profit_pct)
             and anchor > 0
         ):
             continue
@@ -1201,7 +1497,7 @@ def backtest_strategy(
             continue
 
         # -----------------------------------------
-        # POSITION SIZE
+        # POSITION SIZE (بر پایه‌ی SL اختصاصی این معامله)
         # -----------------------------------------
 
         position_fraction = (
@@ -1225,26 +1521,67 @@ def backtest_strategy(
         )
 
         # -----------------------------------------
-        # EXIT RULE
+        # EXIT RULE (مسیر-محور در صورت وجود High/Low بین‌راه)
         # -----------------------------------------
 
+        realized_move = None
         exit_reason = "TIME_EXIT"
 
-        if directional_return <= -stop_loss_pct:
+        if future_highs is not None and future_lows is not None:
 
-            realized_move = -stop_loss_pct
+            if side == "LONG":
+                stop_loss_price = anchor * (1 - stop_loss_pct)
+                take_profit_price = anchor * (1 + take_profit_pct)
+            else:
+                stop_loss_price = anchor * (1 + stop_loss_pct)
+                take_profit_price = anchor * (1 - take_profit_pct)
 
-            exit_reason = "STOP_LOSS"
+            for j in range(future_highs.shape[1]):
 
-        elif directional_return >= take_profit_pct:
+                h = future_highs[i, j]
+                l = future_lows[i, j]
 
-            realized_move = take_profit_pct
+                if not (np.isfinite(h) and np.isfinite(l)):
+                    # داده‌ی ناقص در این کندل - متوقف می‌شیم و به fallback
+                    # زیر (بازده‌ی نهایی افق) واگذار می‌کنیم
+                    break
 
-            exit_reason = "TAKE_PROFIT"
+                if side == "LONG":
+                    hit_tp = h >= take_profit_price
+                    hit_sl = l <= stop_loss_price
+                else:
+                    hit_tp = l <= take_profit_price
+                    hit_sl = h >= stop_loss_price
 
-        else:
+                if hit_tp and hit_sl:
+                    # قانون محافظه‌کارانه‌ی ثابت: چون ترتیب دقیق تیک‌به‌تیک
+                    # داخل کندل رو نداریم، فرض بدبینانه می‌کنیم که SL
+                    # زودتر از TP لمس شده
+                    realized_move = -stop_loss_pct
+                    exit_reason = "STOP_LOSS_AMBIGUOUS_SAME_CANDLE"
+                    break
+                elif hit_sl:
+                    realized_move = -stop_loss_pct
+                    exit_reason = "STOP_LOSS"
+                    break
+                elif hit_tp:
+                    realized_move = take_profit_pct
+                    exit_reason = "TAKE_PROFIT"
+                    break
 
-            realized_move = directional_return
+        if realized_move is None:
+            # یا future_highs/future_lows داده نشده (fallback به رفتار
+            # قدیمی)، یا در طول افق هیچ‌کدوم از SL/TP لمس نشدن (خروج زمانی
+            # واقعی) - در هر دو حالت از بازده‌ی نهایی افق استفاده می‌کنیم
+            if directional_return <= -stop_loss_pct:
+                realized_move = -stop_loss_pct
+                exit_reason = "STOP_LOSS"
+            elif directional_return >= take_profit_pct:
+                realized_move = take_profit_pct
+                exit_reason = "TAKE_PROFIT"
+            else:
+                realized_move = directional_return
+                exit_reason = "TIME_EXIT"
 
         # -----------------------------------------
         # COSTS
@@ -1290,6 +1627,12 @@ def backtest_strategy(
             ),
             "actual_future_return": float(
                 actual_return
+            ),
+            "stop_loss_pct": float(
+                stop_loss_pct
+            ),
+            "take_profit_pct": float(
+                take_profit_pct
             ),
             "realized_directional_move": float(
                 realized_move
@@ -1551,7 +1894,7 @@ def generate_walk_forward_folds(
         Fold 3:
             train ---------------- | val | test
 
-    ?? fold ??? ?? ????? ???? train ??????? ??????.
+    هر fold فقط از گذشته برای train استفاده می‌کند.
     """
 
     if n_samples < 1000:
@@ -1605,6 +1948,34 @@ def generate_walk_forward_folds(
 
 
 # ============================================================
+# PURGE (رفع نشتی مرزی بین Train/Val/Test برای horizon چندکندلی)
+# ============================================================
+
+def purge_target_tail(target_series, horizon_steps):
+    """
+    مشکلی که این تابع حل می‌کنه:
+
+    چون target[i] = log(close[i+horizon_steps] / close[i])، آخرین چند
+    ردیف هر split (مثلاً train) از قیمت‌هایی محاسبه می‌شن که در واقع در
+    بازه‌ی زمانی split *بعدی* (val) اتفاق افتادن. یعنی مدل در حین train،
+    به‌طور غیرمستقیم اطلاعاتی از آینده‌ی نزدیک (داده‌ی validation) رو در
+    برچسب‌هاش می‌بینه - این دقیقاً همون چیزیه که purge/embargo در
+    time-series ML بهش می‌گن و باید حذف بشه.
+
+    این تابع آخرین horizon_steps مقدار target رو NaN می‌کنه؛ چون
+    create_sequences مقادیر non-finite رو حذف می‌کنه، این عملاً یعنی
+    نمونه‌های نزدیک به مرز از train/val کنار گذاشته می‌شن (purge واقعی).
+    """
+    if horizon_steps <= 0 or len(target_series) == 0:
+        return target_series
+
+    purged = target_series.copy()
+    n_to_purge = min(horizon_steps, len(purged))
+    purged.iloc[-n_to_purge:] = np.nan
+    return purged
+
+
+# ============================================================
 # BUILD FOLD DATA
 # ============================================================
 
@@ -1615,18 +1986,24 @@ def prepare_fold_data(
     val_end,
     test_end,
     sequence_length,
+    horizon_steps=0,
 ):
     """
-    ????? ???:
+    بسیار مهم:
 
-    ???? validation ? test? history ????? ?? ??? ??? ?? ??? ????????.
+    برای validation و test، history مربوط به بخش قبل را نگه می‌داریم.
 
-    ??? scaler ??? ??? train fit ??????.
+    اما scaler فقط روی train fit می‌شود.
 
-    ??? ??? ???? ?????? ????? sequence??? validation/test ???????
-    history ????? ??? ?? split ?? ??????.
+    این کار باعث می‌شود اولین sequenceهای validation/test بتوانند
+    history واقعی قبل از split را ببینند.
 
-    ??? future target ???? sequence ???????.
+    هیچ future target وارد sequence نمی‌شود.
+
+    Purge (اصلاح جدید): horizon_steps > 0 باعث می‌شه آخرین horizon_steps
+    مقدار target در train و val (که به بازه‌ی زمانی split بعدی نشت
+    می‌کردن) حذف بشن - جلوگیری از leakage مرزی که در نسخه‌ی قبلی این
+    فایل وجود نداشت.
     """
 
     # -------------------------
@@ -1640,6 +2017,10 @@ def prepare_fold_data(
     train_target = target_series.iloc[
         :train_end
     ]
+
+    train_target = purge_target_tail(
+        train_target, horizon_steps
+    )
 
     # -------------------------
     # Validation
@@ -1661,11 +2042,18 @@ def prepare_fold_data(
         val_context_start:val_end
     ]
 
+    val_target = purge_target_tail(
+        val_target, horizon_steps
+    )
+
     # -------------------------
     # Test
     #
     # Include context from before
     # test start.
+    #
+    # نکته: تیل test عمداً purge نمی‌شه چون هیچ split دیگه‌ای داخل همین
+    # fold بعد از test نمیاد که ازش نشت کنه (هر fold مستقل از fold بعدیه).
     # -------------------------
 
     test_context_start = max(
@@ -1704,7 +2092,7 @@ def build_gru_model_tunable(
     """
     Optional KerasTuner model.
 
-    ???? MVP ????? ???.
+    برای MVP خاموش است.
     """
 
     gru_units = hp.Choice(
@@ -1780,10 +2168,8 @@ def build_gru_model_tunable(
 
 
 def run_hyperparameter_search(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
+    train_dataset,
+    val_dataset,
     input_shape,
     output_dir,
     max_trials=20,
@@ -1791,6 +2177,12 @@ def run_hyperparameter_search(
 ):
     """
     Optional Bayesian Optimization.
+
+    اصلاح: حالا train_dataset/val_dataset، tf.data.Dataset (از
+    build_lazy_sequence_dataset) هستن، نه آرایه‌ی eager X/y جدا - چون
+    KerasTuner از Dataset پشتیبانی می‌کنه (دقیقاً مثل model.fit)، فقط
+    batch_size/y جدا لازم نیست چون دیتاست خودش batch شده و (X,y) رو با
+    هم برمی‌گردونه.
     """
 
     import keras_tuner as kt
@@ -1818,14 +2210,9 @@ def run_hyperparameter_search(
     )
 
     tuner.search(
-        X_train,
-        y_train,
-        validation_data=(
-            X_val,
-            y_val,
-        ),
+        train_dataset,
+        validation_data=val_dataset,
         epochs=epochs_per_trial,
-        batch_size=BATCH_SIZE,
         callbacks=[
             early_stopping
         ],
@@ -1849,12 +2236,18 @@ def save_metadata(
     output_path,
     fold_idx,
     scaler,
+    train_date_range=None,
+    test_date_range=None,
 ):
     """
     Save model metadata.
 
-    ??? metadata ????? ?? crypto-signal-api ???? ??????? ?? mismatch
-    ??? model ? feature pipeline ??????? ????? ??.
+    این metadata بعداً در crypto-signal-api برای جلوگیری از mismatch
+    بین model و feature pipeline استفاده خواهد شد.
+
+    train_date_range / test_date_range: تاپل (start, end) به‌صورت رشته -
+    مشخص می‌کنه این مدل روی کدوم بازه‌ی زمانی واقعی train/test شده، تا
+    بعداً بشه فهمید مدل برای کدوم رژیم بازار مناسب‌تره.
     """
 
     metadata = {
@@ -1892,12 +2285,22 @@ def save_metadata(
             "slippage_rate": SLIPPAGE_RATE,
             "signal_threshold": SIGNAL_THRESHOLD,
             "risk_per_trade": RISK_PER_TRADE,
-            "stop_loss_pct": STOP_LOSS_PCT,
-            "take_profit_pct": TAKE_PROFIT_PCT,
+            "atr_multiplier_sl": ATR_MULTIPLIER_SL,
+            "atr_multiplier_tp": ATR_MULTIPLIER_TP,
+            "min_stop_loss_pct": MIN_STOP_LOSS_PCT,
+            "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
             "max_leverage": MAX_LEVERAGE,
         },
 
         "fold": fold_idx,
+        "train_date_range": {
+            "start": train_date_range[0] if train_date_range else None,
+            "end": train_date_range[1] if train_date_range else None,
+        },
+        "test_date_range": {
+            "start": test_date_range[0] if test_date_range else None,
+            "end": test_date_range[1] if test_date_range else None,
+        },
 
         "scaler": {
             "type": "StandardScaler",
@@ -1928,6 +2331,9 @@ def save_metadata(
 def main():
     set_seed()
 
+    # --- کاهش مصرف رم GPU با mixed precision (float16 برای محاسبات، float32 برای وزن‌ها) ---
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
     # --------------------------------------------------------
     # DATA PATH
     # --------------------------------------------------------
@@ -1936,6 +2342,11 @@ def main():
         "/content/drive/MyDrive/"
         "binance_data_5min.csv"
     )
+
+    # محدود کردن دیتا به بازه‌ی زمانی اخیر - هم رم رو کنترل می‌کنه هم
+    # مدل رو روی رژیم فعلی بازار متمرکز می‌کنه (نه رژیم‌های قدیمی که
+    # دیگه تکرار نمی‌شن). None یعنی بدون محدودیت (کل دیتا از ابتدا).
+    MIN_DATA_DATE = "2023-01-01"  # حدود ۳ سال آخر - در صورت نیاز تغییر بدید
 
     os.makedirs(
         OUTPUT_DIR,
@@ -1974,6 +2385,11 @@ def main():
         f"Target       : future_log_return"
     )
 
+    print(
+        f"Risk model   : ATR-based SL "
+        f"({ATR_MULTIPLIER_SL}x) / TP ({ATR_MULTIPLIER_TP}x)"
+    )
+
     # --------------------------------------------------------
     # LOAD DATA
     # --------------------------------------------------------
@@ -1981,6 +2397,23 @@ def main():
     data = load_and_preprocess_data(
         file_path
     )
+
+    print(f"\n[DATA] Full range loaded: {data.index.min()} -> {data.index.max()} ({len(data):,} rows)")
+
+    if MIN_DATA_DATE is not None:
+        data = data[data.index >= MIN_DATA_DATE]
+        print(f"[DATA] Filtered to >= {MIN_DATA_DATE}: {len(data):,} rows remaining")
+
+    # --- Quick Test: محدود کردن به آخرین ردیف‌ها برای اجرای سریع/سلامت‌سنجی ---
+    effective_epochs = EPOCHS
+    if QUICK_TEST:
+        data = data.iloc[-QUICK_TEST_ROWS:]
+        effective_epochs = QUICK_TEST_EPOCHS
+        print(
+            f"[QUICK TEST MODE] Using only last {len(data):,} rows, "
+            f"epochs limited to {effective_epochs}. "
+            f"بعد از موفقیت، QUICK_TEST = False کنید و اجرای کامل بگیرید."
+        )
 
     check_candle_gaps(
         data,
@@ -2015,6 +2448,11 @@ def main():
             f"Missing feature columns: {missing}"
         )
 
+    # ATR رو جدا از FEATURE_COLUMNS هم نگه می‌داریم چون برای بک‌تست لازمه
+    # (حتی اگه به هر دلیلی از FEATURE_COLUMNS حذفش کنید، بک‌تست همچنان
+    # کار می‌کنه چون از خودِ feature_data قبل از reindex می‌خونتش)
+    atr_series_full = feature_data["ATR"].copy()
+
     feature_data = (
         feature_data[
             FEATURE_COLUMNS
@@ -2025,6 +2463,9 @@ def main():
         )
         .dropna()
     )
+
+    # هماهنگ کردن ATR با ایندکس نهایی feature_data (بعد از dropna)
+    atr_series_full = atr_series_full.reindex(feature_data.index)
 
     # --------------------------------------------------------
     # TARGET
@@ -2087,16 +2528,31 @@ def main():
             f"FOLD {fold_idx}/{len(folds)}"
         )
 
+        # --- بازه‌ی زمانی واقعی هر fold (نه فقط ایندکس ردیف) ---
+        # این برای دیتای طولانی‌مدت (مثلاً از 2018) حیاتیه: بدون این،
+        # نمی‌شه فهمید هر fold دقیقاً کدوم رژیم بازار (خرسی/گاوی/رنج) رو
+        # پوشش می‌ده، و مقایسه‌ی عملکرد مدل بین fold های مختلف بی‌معنی
+        # می‌مونه.
+        train_start_date = feature_data.index[train_start]
+        train_end_date = feature_data.index[val_start - 1]
+        val_start_date = feature_data.index[val_start]
+        val_end_date = feature_data.index[test_start - 1]
+        test_start_date = feature_data.index[test_start]
+        test_end_date = feature_data.index[min(test_end, len(feature_data)) - 1]
+
         print(
-            f"Train: 0 -> {val_start}"
+            f"Train: 0 -> {val_start}  "
+            f"({train_start_date} -> {train_end_date})"
         )
 
         print(
-            f"Val  : {val_start} -> {test_start}"
+            f"Val  : {val_start} -> {test_start}  "
+            f"({val_start_date} -> {val_end_date})"
         )
 
         print(
-            f"Test : {test_start} -> {test_end}"
+            f"Test : {test_start} -> {test_end}  "
+            f"({test_start_date} -> {test_end_date})"
         )
 
         print("=" * 70)
@@ -2117,6 +2573,7 @@ def main():
             val_end=test_start,
             test_end=test_end,
             sequence_length=SEQUENCE_LENGTH,
+            horizon_steps=HORIZON_STEPS,
         )
 
         # ----------------------------------------------------
@@ -2150,57 +2607,55 @@ def main():
         )
 
         # ----------------------------------------------------
-        # SEQUENCES
+        # SEQUENCES (lazy - رفع OOM)
         # ----------------------------------------------------
+        #
+        # به‌جای create_sequences/create_sequences_with_indices (که کل
+        # تانسور N×seq_length×features رو eager می‌سازن)، از
+        # build_lazy_sequence_dataset استفاده می‌کنیم که فقط anchor های
+        # معتبر رو (با اسکن برداری ارزون) پیدا می‌کنه و پنجره‌ها رو در
+        # لحظه‌ی نیاز (batch به batch) تولید می‌کنه.
 
-        X_train, y_train = (
-            create_sequences(
-                train_scaled,
-                train_target.values,
-                SEQUENCE_LENGTH,
-            )
+        train_dataset, train_anchors = build_lazy_sequence_dataset(
+            train_scaled,
+            train_target.values,
+            SEQUENCE_LENGTH,
+            batch_size=BATCH_SIZE,
+            shuffle_buffer=None,  # سری زمانی - شافل نمی‌کنیم (رفتار قبلی shuffle=False حفظ شد)
         )
 
-        (
-            X_val,
-            y_val,
-            val_anchor_indices,
-            val_times,
-        ) = create_sequences_with_indices(
+        val_dataset, val_anchors_local = build_lazy_sequence_dataset(
             val_scaled,
             val_target.values,
-            val_df.index,
             SEQUENCE_LENGTH,
+            batch_size=BATCH_SIZE,
+            shuffle_buffer=None,
         )
 
-        (
-            X_test,
-            y_test,
-            test_anchor_indices,
-            test_times,
-        ) = create_sequences_with_indices(
+        test_dataset, test_anchors_local = build_lazy_sequence_dataset(
             test_scaled,
             test_target.values,
-            test_df.index,
             SEQUENCE_LENGTH,
+            batch_size=BATCH_SIZE,
+            shuffle_buffer=None,
         )
 
         print(
-            f"[SEQUENCES] Train: {len(X_train):,}"
+            f"[SEQUENCES] Train: {len(train_anchors):,}"
         )
 
         print(
-            f"[SEQUENCES] Val  : {len(X_val):,}"
+            f"[SEQUENCES] Val  : {len(val_anchors_local):,}"
         )
 
         print(
-            f"[SEQUENCES] Test : {len(X_test):,}"
+            f"[SEQUENCES] Test : {len(test_anchors_local):,}"
         )
 
         if (
-            len(X_train) == 0
-            or len(X_val) == 0
-            or len(X_test) == 0
+            len(train_anchors) == 0
+            or len(val_anchors_local) == 0
+            or len(test_anchors_local) == 0
         ):
 
             print(
@@ -2215,8 +2670,8 @@ def main():
         # ----------------------------------------------------
 
         input_shape = (
-            X_train.shape[1],
-            X_train.shape[2],
+            SEQUENCE_LENGTH,
+            train_scaled.shape[1],
         )
 
         if (
@@ -2230,10 +2685,8 @@ def main():
 
             best_hp = (
                 run_hyperparameter_search(
-                    X_train,
-                    y_train,
-                    X_val,
-                    y_val,
+                    train_dataset,
+                    val_dataset,
                     input_shape,
                     OUTPUT_DIR,
                     HP_SEARCH_MAX_TRIALS,
@@ -2283,11 +2736,11 @@ def main():
 
         model, history = train_model(
             model,
-            X_train,
-            y_train,
-            X_val,
-            y_val,
-            epochs=EPOCHS,
+            train_dataset,
+            None,
+            val_dataset,
+            None,
+            epochs=effective_epochs,
             batch_size=BATCH_SIZE,
             model_save_path=model_path,
             verbose=1,
@@ -2298,12 +2751,16 @@ def main():
         # ----------------------------------------------------
 
         predictions = model.predict(
-            X_test,
+            test_dataset,
             verbose=0,
         ).reshape(-1)
 
+        # y_test_flat: چون generator داخل build_lazy_sequence_dataset دقیقاً
+        # به همون ترتیب test_anchors_local مقدار target رو yield می‌کنه،
+        # بازسازی مستقیم از test_target.values هم دقیقاً همون ترتیب رو
+        # می‌ده - بدون نیاز به عبور دوباره از دیتاست.
         y_test_flat = (
-            y_test.reshape(-1)
+            test_target.values[test_anchors_local]
         )
 
         # ----------------------------------------------------
@@ -2351,25 +2808,67 @@ def main():
             )
 
         # ----------------------------------------------------
-        # ANCHOR PRICES
+        # ANCHOR PRICES + ANCHOR ATR + TIMESTAMPS
         # ----------------------------------------------------
 
-        # test_anchor_indices are local indices inside test_df.
+        # test_anchors_local ایندکس‌های محلی داخل test_df هستن.
         #
-        # test_df starts at test_context_start.
+        # test_df از test_context_start شروع می‌شه.
         #
-        # Convert local anchor index to global feature index.
+        # تبدیل ایندکس محلی به ایندکس global در feature_data.
 
         global_test_indices = (
             test_context_start
-            + test_anchor_indices
+            + test_anchors_local
         )
+
+        test_times = test_df.index[test_anchors_local]
 
         anchor_prices = (
             feature_data.iloc[
                 global_test_indices
             ]["close"]
             .values
+        )
+
+        # ATR در لحظه‌ی anchor - برای محاسبه‌ی SL/TP اختصاصی هر معامله
+        anchor_atr = (
+            atr_series_full.iloc[
+                global_test_indices
+            ]
+            .values
+        )
+
+        # ----------------------------------------------------
+        # FUTURE HIGH/LOW (برای بک‌تست مسیر-محور)
+        # ----------------------------------------------------
+        #
+        # برای هر anchor، high/low کندل‌های 1 تا HORIZON_STEPS بعد از اون
+        # (نه شامل خود anchor) رو استخراج می‌کنیم تا backtest_strategy
+        # بتونه کندل‌به‌کندل چک کنه SL/TP کجا واقعاً لمس شده.
+        #
+        # نکته: چون target قبلاً برای همین انکرها finite بوده (یعنی
+        # close[anchor+HORIZON_STEPS] در feature_data وجود داشته)، این
+        # ایندکس‌ها همیشه در محدوده‌ی feature_data معتبرن - نیازی به
+        # کلمپ کردن نیست.
+
+        raw_high = feature_data["high"].values
+        raw_low = feature_data["low"].values
+
+        future_highs = np.stack(
+            [
+                raw_high[global_test_indices + j]
+                for j in range(1, HORIZON_STEPS + 1)
+            ],
+            axis=1,
+        )
+
+        future_lows = np.stack(
+            [
+                raw_low[global_test_indices + j]
+                for j in range(1, HORIZON_STEPS + 1)
+            ],
+            axis=1,
         )
 
         # ----------------------------------------------------
@@ -2380,14 +2879,17 @@ def main():
             anchor_prices=anchor_prices,
             actual_future_returns=y_test_flat,
             predicted_returns=predictions,
+            atr_values=anchor_atr,
+            future_highs=future_highs,
+            future_lows=future_lows,
             timestamps=test_times,
             initial_capital=INITIAL_CAPITAL,
             fee_rate=FEE_RATE,
             slippage_rate=SLIPPAGE_RATE,
             signal_threshold=SIGNAL_THRESHOLD,
             risk_per_trade=RISK_PER_TRADE,
-            stop_loss_pct=STOP_LOSS_PCT,
-            take_profit_pct=TAKE_PROFIT_PCT,
+            atr_multiplier_sl=ATR_MULTIPLIER_SL,
+            atr_multiplier_tp=ATR_MULTIPLIER_TP,
             max_leverage=MAX_LEVERAGE,
         )
 
@@ -2464,6 +2966,8 @@ def main():
             metadata_path,
             fold_idx,
             scaler,
+            train_date_range=(str(train_start_date), str(train_end_date)),
+            test_date_range=(str(test_start_date), str(test_end_date)),
         )
 
         # ----------------------------------------------------
@@ -2474,6 +2978,7 @@ def main():
             {
                 "timestamp": test_times,
                 "anchor_price": anchor_prices,
+                "anchor_atr": anchor_atr,
                 "actual_future_log_return": y_test_flat,
                 "predicted_future_log_return": predictions,
                 "actual_future_return_pct": (
@@ -2545,6 +3050,12 @@ def main():
 
         fold_result = {
             "fold": fold_idx,
+            "train_start_date": str(train_start_date),
+            "train_end_date": str(train_end_date),
+            "val_start_date": str(val_start_date),
+            "val_end_date": str(val_end_date),
+            "test_start_date": str(test_start_date),
+            "test_end_date": str(test_end_date),
             **metrics,
             "Naive_RMSE": naive_metrics[
                 "RMSE"
@@ -2600,6 +3111,8 @@ def main():
         backtest_results.append(
             {
                 "fold": fold_idx,
+                "test_start_date": str(test_start_date),
+                "test_end_date": str(test_end_date),
                 "strategy_return_%":
                     bt[
                         "total_return_pct"
@@ -2630,6 +3143,26 @@ def main():
                     ],
             }
         )
+
+        # ----------------------------------------------------
+        # CLEANUP (رفع OOM بین Foldها)
+        # ----------------------------------------------------
+        #
+        # بدون این، حافظه‌ی مدل قبلی (وزن‌ها، optimizer state، گراف
+        # محاسباتی TensorFlow) و آرایه‌های سنگین این fold (train_scaled,
+        # val_scaled, test_scaled, future_highs/lows, ...) تا پایان کل
+        # اجرا در RAM باقی می‌مونن و روی هم انباشته می‌شن - با ۴ fold و
+        # دیتای چندصدهزار ردیفی، این خودش می‌تونه باعث OOM بشه حتی اگه
+        # هر fold به‌تنهایی مشکلی نداشته باشه.
+
+        del model
+        del train_dataset, val_dataset, test_dataset
+        del train_scaled, val_scaled, test_scaled
+        del future_highs, future_lows
+        del predictions, y_test_flat
+
+        tf.keras.backend.clear_session()
+        gc.collect()
 
     # ========================================================
     # FINAL SUMMARY
@@ -2711,7 +3244,7 @@ def main():
 
 if __name__ == "__main__":
 
-    # ??? ?? Colab ????? ??? ?? ?? ?? ?? ??? ???? ??:
+    # اگر در Colab هستی، این دو خط را یک بار اجرا کن:
     #
     # from google.colab import drive
     # drive.mount('/content/drive')
