@@ -92,6 +92,10 @@ from features import (
     validate_feature_schema,
 )
 
+# --- تنظیمات مخصوص دارایی - فایل مشترک با crypto-predict-api ---
+# (کپی همین asset_config.py را کنار این فایل قرار دهید)
+from asset_config import ACTIVE_ASSET
+
 
 # ============================================================
 # CONFIG
@@ -99,61 +103,53 @@ from features import (
 
 SEED = 42
 
-SYMBOL = "ETHUSDT"
-
-TIMEFRAME_MINUTES = 5
-HORIZON_MINUTES = 15
+# --- همه‌ی مقادیر زیر از asset_config.py می‌آیند، نه اینجا تعریف می‌شن ---
+# برای سوییچ دارایی (مثلاً ETH -> SOL)، فقط ACTIVE_ASSET در asset_config.py
+# را عوض کنید - این فایل نیازی به تغییر نداره.
+SYMBOL = ACTIVE_ASSET.symbol
+TIMEFRAME_MINUTES = ACTIVE_ASSET.timeframe_minutes
+HORIZON_MINUTES = ACTIVE_ASSET.horizon_minutes
 
 assert HORIZON_MINUTES % TIMEFRAME_MINUTES == 0
 
-HORIZON_STEPS = HORIZON_MINUTES // TIMEFRAME_MINUTES
+HORIZON_STEPS = ACTIVE_ASSET.horizon_steps
 
 # 96 × 5m = 8 hours of history
 SEQUENCE_LENGTH = 96
 
 N_FOLDS = 4
 
-# Trading assumptions
+# Trading assumptions - این‌ها استراتژی بک‌تسته، نه وابسته به نوع دارایی؛
+# عمداً در asset_config.py نیستن (مستقل از ETH/SOL همون می‌مونن، مگر
+# اینکه خودتون دستی عوض کنید).
 INITIAL_CAPITAL = 1000.0
-
-# One-way fee.
-FEE_RATE = 0.0004
-
-# Conservative slippage assumption per side.
-SLIPPAGE_RATE = 0.0002
-
-# Model must predict at least this much expected movement.
-SIGNAL_THRESHOLD = 0.0010  # 0.10%
-
-# Risk used in simulated position sizing.
 RISK_PER_TRADE = 0.01  # 1%
-
-# Maximum leverage for simulation.
 MAX_LEVERAGE = 1.0
+
+FEE_RATE = ACTIVE_ASSET.fee_rate
+SLIPPAGE_RATE = ACTIVE_ASSET.slippage_rate
+SIGNAL_THRESHOLD = ACTIVE_ASSET.signal_threshold
 
 # Backtest opens at most one new trade per prediction horizon.
 ENTRY_INTERVAL_MINUTES = HORIZON_MINUTES
 
-# --- ATR-based risk management ---
-ATR_MULTIPLIER_SL = 1.5
-ATR_MULTIPLIER_TP = 2.25  # R:R = 1:1.5
-
-# حداقل و حداکثر فاصله‌ی SL به‌عنوان درصد قیمت
-MIN_STOP_LOSS_PCT = 0.0015  # 0.15%
-MAX_STOP_LOSS_PCT = 0.0100  # 1.00%
+# --- ATR-based risk management (از asset_config) ---
+ATR_MULTIPLIER_SL = ACTIVE_ASSET.atr_multiplier_sl
+ATR_MULTIPLIER_TP = ACTIVE_ASSET.atr_multiplier_tp
+MIN_STOP_LOSS_PCT = ACTIVE_ASSET.min_stop_loss_pct
+MAX_STOP_LOSS_PCT = ACTIVE_ASSET.max_stop_loss_pct
 
 MAX_HOLDING_STEPS = HORIZON_STEPS
 
 EPOCHS = 100
-BATCH_SIZE = 128
-PATIENCE = 10
+BATCH_SIZE = 32   # از 128 برگردوندیم - batch بزرگ باعث overfitting سریع و همگرایی به minimum های تیز شد
+PATIENCE = 5      # از 10 کم شد - مدل قبلی خیلی سریع (epoch 9-13) به بهترین val_loss می‌رسید؛ صبر بیشتر فقط اجازه‌ی overfit بیشتر می‌داد
 
-OUTPUT_DIR = "/content/drive/MyDrive/model_outputs_gru"
+# خروجی هر دارایی جدا ذخیره می‌شه تا نتایج ETH و SOL قاطی نشن
+OUTPUT_DIR = f"/content/drive/MyDrive/model_outputs_gru_{SYMBOL}"
 
-# --- Data filter (اختیاری) ---
-# None = کل دیتا (8 سال)
-# "2023-01-01" = فقط 3 سال آخر (سریع‌تر، رژیم فعلی)
-MIN_DATA_DATE = "2023-01-01"
+# --- Data filter (از asset_config) ---
+MIN_DATA_DATE_MONTHS_BACK = ACTIVE_ASSET.min_data_months_back
 
 # --- Quick Test ---
 QUICK_TEST = False
@@ -483,10 +479,10 @@ def build_tf_dataset(
 def build_gru_model(
     input_shape,
     gru_units=64,
-    dropout_rate=0.20,
+    dropout_rate=0.35,   # از 0.20 افزایش یافت - overfitting شدید نسخه‌ی قبلی (loss از 0.019 به 0.0000028 در 13 epoch) نیاز به regularization قوی‌تر داشت
     num_heads=4,
     key_dim=16,
-    l2_reg=1e-4,
+    l2_reg=5e-4,         # از 1e-4 افزایش یافت - همون دلیل بالا
     dense_units=32,
     learning_rate=1e-3,
 ):
@@ -1129,6 +1125,33 @@ def plot_equity_curve(equity_curve, output_path):
 # WALK FORWARD (با مرزهای تقویمی + tz-aware)
 # ============================================================
 
+def generate_simple_split(n_samples, train_ratio=0.8, val_ratio=0.1):
+    """
+    تقسیم‌بندی ساده‌ی خطی (بدون walk-forward/fold) برای فاز فعلی «هدف
+    ترید عملی، نه اعتبارسنجی پژوهشی».
+
+    چرا به‌جای چند fold: با N_FOLDS=4 و رژیم‌های متفاوت بازار در هر fold،
+    فقط زمان train رو چند برابر می‌کرد بدون این‌که مشکل اصلی (آیا مدل
+    اصلاً از baseline نایو بهتره یا نه) رو حل کنه. یک split ساده برای
+    این فاز کافیه؛ وقتی مدل پایه جواب داد، می‌شه دوباره سراغ
+    generate_walk_forward_folds (که دست‌نخورده در فایل باقی مونده) رفت.
+
+    ترتیب زمانی همیشه: train (قدیمی‌ترین) -> val -> test (جدیدترین).
+    این جهت عمدیه: مدل نباید موقع train به داده‌ای که از نظر زمانی بعدتره
+    (چه val چه test) دسترسی داشته باشه - وگرنه شبیه‌سازی واقعی از دست
+    می‌ره (در دنیای واقعی هیچ‌وقت داده‌ی آینده رو موقع train ندارید).
+
+    خروجی: لیستی با یک عضو، در همون فرمت (train_start, val_start,
+    test_start, test_end) که generate_walk_forward_folds تولید می‌کرد -
+    یعنی بدنه‌ی حلقه‌ی fold در main() نیازی به تغییر نداره.
+    """
+    train_end = int(n_samples * train_ratio)
+    val_end = int(n_samples * (train_ratio + val_ratio))
+    test_end = n_samples
+
+    return [(0, train_end, val_end, test_end)]
+
+
 def generate_walk_forward_folds(n_samples, n_folds=N_FOLDS, timestamps=None):
     """
     Expanding-window walk-forward با مرزهای تقویمی واقعی.
@@ -1448,7 +1471,7 @@ def main():
     # DATA PATH
     # --------------------------------------------------------
 
-    file_path = "/content/drive/MyDrive/binance_data_5min.csv"
+    file_path = "/content/drive/MyDrive/sol_6month_5min.csv"
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -1479,11 +1502,16 @@ def main():
         f"{data.index.max()} ({len(data):,} rows)"
     )
 
-    if MIN_DATA_DATE is not None:
-        data = data[data.index >= MIN_DATA_DATE]
+    if MIN_DATA_DATE_MONTHS_BACK is not None:
+        # نسبت به آخرین کندل موجود در دیتا محاسبه می‌شه (نه نسبت به
+        # تاریخ امروز) - چون وقتی هفتگی re-train می‌کنید، "6 ماه اخیر"
+        # باید نسبت به جدیدترین داده‌ای باشه که دارید، نه یک تاریخ ثابت
+        # که هر re-train باید دستی آپدیتش کنید.
+        cutoff_date = data.index.max() - pd.DateOffset(months=MIN_DATA_DATE_MONTHS_BACK)
+        data = data[data.index >= cutoff_date]
         print(
-            f"[DATA] Filtered to >= {MIN_DATA_DATE}: "
-            f"{len(data):,} rows remaining"
+            f"[DATA] Filtered to last {MIN_DATA_DATE_MONTHS_BACK} months "
+            f"(>= {cutoff_date}): {len(data):,} rows remaining"
         )
 
     # --- Quick Test ---
@@ -1538,15 +1566,21 @@ def main():
     # --------------------------------------------------------
 
     n_samples = len(feature_data)
-       
-    folds = generate_walk_forward_folds(
+
+    # --- تصمیم معماری: split ساده به‌جای walk-forward چندگانه ---
+    # برای فاز فعلی (هدف: ترید عملی، نه اعتبارسنجی چندرژیمی)، یک split
+    # خطی 80/10/10 استفاده می‌کنیم. اگه بعداً خواستید به walk-forward چندگانه
+    # برگردید، فقط این خط رو با generate_walk_forward_folds(n_samples,
+    # N_FOLDS, timestamps=feature_data.index) جایگزین کنید - بدنه‌ی حلقه
+    # نیازی به تغییر نداره.
+    folds = generate_simple_split(
         n_samples,
-        N_FOLDS,
-        timestamps=feature_data.index,
+        train_ratio=0.8,
+        val_ratio=0.1,
     )
 
     print(f"\n[DATA] Total usable rows: {n_samples:,}")
-    print(f"[WALK-FORWARD] Folds: {len(folds)}")
+    print(f"[SPLIT] Simple 80/10/10 split (no walk-forward folds this phase)")
 
     fold_results = []
     backtest_results = []

@@ -1,0 +1,10 @@
+my_tensorflow_env/
+node_modules/
+outputs/
+data/
+archive/
+__pycache__/
+.venv-1/
+.venv/
+.env
+hardhat.config

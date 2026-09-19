@@ -21,10 +21,14 @@ receives A,B,C,D,E").
 import numpy as np
 
 # هر تغییری در منطق فیچرها (اضافه/حذف/تغییر فرمول) باید این عدد رو افزایش بده.
-FEATURE_VERSION = "v1"
+FEATURE_VERSION = "v2"
 
 # ترتیب دقیق فیچرها - این ترتیب باید در train و inference عیناً یکی باشه،
 # چون هم scaler و هم مدل بر همین اساس train شدن.
+#
+# v2: اضافه شدن ۵ فیچر جدید (VWAP, VWAP_Distance_Pct, Stochastic %K/%D,
+# ROC, HL_Range_Pct) - همه از خود OHLCV محاسبه می‌شن، بدون نیاز به دیتای
+# خارجی (مثل funding rate که بعداً جدا اضافه می‌شه).
 FEATURE_COLUMNS = [
     "close", "open", "high", "low", "volume",
     "SMA", "RSI",
@@ -33,6 +37,10 @@ FEATURE_COLUMNS = [
     "MACD", "MACD_Signal", "MACD_Hist",
     "Relative_Volume",
     "Hour_Sin", "Hour_Cos", "DOW_Sin", "DOW_Cos",
+    "VWAP", "VWAP_Distance_Pct",
+    "Stoch_K", "Stoch_D",
+    "ROC",
+    "HL_Range_Pct",
 ]
 NUM_FEATURES = len(FEATURE_COLUMNS)
 
@@ -92,6 +100,41 @@ def add_technical_indicators(data, rsi_period=14, bb_period=20, bb_std=2, atr_pe
     data["Hour_Cos"] = np.cos(2 * np.pi * hour / 24)
     data["DOW_Sin"] = np.sin(2 * np.pi * dow / 7)
     data["DOW_Cos"] = np.cos(2 * np.pi * dow / 7)
+
+    # --- v2: فیچرهای جدید (بدون نیاز به دیتای خارجی) ---
+
+    # VWAP غلتان (نه VWAP تجمعی از ابتدای روز، چون برای دیتای پیوسته‌ی
+    # چندماهه معنی نداره) - میانگین وزنی قیمت بر اساس حجم در یک پنجره‌ی
+    # ۲۰ کندلی، مشابه پنجره‌ی Bollinger برای هماهنگی مقیاس زمانی
+    typical_price = (data["high"] + data["low"] + data["close"]) / 3
+    vwap_window = 20
+    pv = typical_price * data["volume"]
+    data["VWAP"] = (
+        pv.rolling(window=vwap_window).sum()
+        / data["volume"].rolling(window=vwap_window).sum().replace(0, np.nan)
+    )
+    # فاصله‌ی نسبی قیمت از VWAP - سیگنال mean-reversion (مثبت = قیمت بالاتر از VWAP)
+    data["VWAP_Distance_Pct"] = (data["close"] - data["VWAP"]) / data["VWAP"]
+
+    # Stochastic Oscillator (%K, %D) - پنجره‌ی ۱۴ کندلی (استاندارد رایج)،
+    # عمداً متفاوت از پنجره‌ی RSI (که وایلدر-محوره) تا مکمل باشه نه تکراری
+    stoch_period = 14
+    lowest_low = data["low"].rolling(window=stoch_period).min()
+    highest_high = data["high"].rolling(window=stoch_period).max()
+    stoch_range = (highest_high - lowest_low).replace(0, np.nan)
+    data["Stoch_K"] = 100 * (data["close"] - lowest_low) / stoch_range
+    data["Stoch_D"] = data["Stoch_K"].rolling(window=3).mean()  # میانگین‌گیری هموارساز استاندارد
+
+    # Rate of Change - مومنتوم ساده نسبت به N کندل قبل، مکمل MACD
+    roc_period = 10
+    data["ROC"] = (
+        (data["close"] - data["close"].shift(roc_period))
+        / data["close"].shift(roc_period)
+    )
+
+    # دامنه‌ی نوسان درون‌کندلی نسبی - مکمل ATR (که میانگین‌گیری‌شده روی
+    # چند کندله)؛ این فیچر لحظه‌ایه و فقط به همون یک کندل مربوطه
+    data["HL_Range_Pct"] = (data["high"] - data["low"]) / data["close"]
 
     data.dropna(inplace=True)
     return data
